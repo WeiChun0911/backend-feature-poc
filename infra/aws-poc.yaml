@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Minimal direct-to-Kestrel host for the backend feature PoC.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: backend-feature-poc
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  GoogleOAuthParameterReadPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: BackendFeaturePocGoogleOAuthParameterRead
+      Roles:
+        - !Ref InstanceRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:GetParameter
+            Resource:
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/backend-feature-poc/google-*
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub ssm.${AWS::Region}.${AWS::URLSuffix}
+              ForAnyValue:StringLike:
+                kms:EncryptionContext:PARAMETER_ARN:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/backend-feature-poc/google-*
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTPS PoC; HTTP is used for ACME certificate validation.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: ACME HTTP-01 certificate validation
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS traffic to Kestrel
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: backend-feature-poc
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-04bde3808fe5f70cf
+      InstanceType: t4g.micro
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 16
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y aspnetcore-runtime-10.0 python3-certbot
+          useradd --system --create-home --shell /sbin/nologin backend-feature-poc
+          install -d -o backend-feature-poc -g backend-feature-poc /opt/backend-feature-poc
+          install -d -o root -g backend-feature-poc -m 0750 /etc/backend-feature-poc
+          install -d -o root -g backend-feature-poc -m 0750 /etc/backend-feature-poc/tls
+          install -d -o root -g root -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+          cat >/etc/systemd/system/backend-feature-poc.service <<'UNIT'
+          [Unit]
+          Description=Backend Feature PoC
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=backend-feature-poc
+          Group=backend-feature-poc
+          WorkingDirectory=/opt/backend-feature-poc
+          Environment=ASPNETCORE_ENVIRONMENT=Production
+          Environment=Authentication__RequireGoogleAuth=true
+          Environment=Tls__CertificatePath=/etc/backend-feature-poc/tls/fullchain.pem
+          Environment=Tls__PrivateKeyPath=/etc/backend-feature-poc/tls/privkey.pem
+          EnvironmentFile=-/etc/backend-feature-poc/app.env
+          ExecStart=/usr/bin/dotnet /opt/backend-feature-poc/BackendFeaturePoc.dll
+          Restart=on-failure
+          RestartSec=5
+          NoNewPrivileges=true
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+          PrivateTmp=true
+          ProtectSystem=full
+          ProtectHome=true
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          cat >/etc/letsencrypt/renewal-hooks/deploy/backend-feature-poc.sh <<'HOOK'
+          #!/bin/bash
+          set -euo pipefail
+          install -o backend-feature-poc -g backend-feature-poc -m 0644 \
+            /etc/letsencrypt/live/willywcliu.duckdns.org/fullchain.pem \
+            /etc/backend-feature-poc/tls/fullchain.pem
+          install -o backend-feature-poc -g backend-feature-poc -m 0640 \
+            /etc/letsencrypt/live/willywcliu.duckdns.org/privkey.pem \
+            /etc/backend-feature-poc/tls/privkey.pem
+          if systemctl is-active --quiet backend-feature-poc; then
+            systemctl restart backend-feature-poc
+          fi
+          HOOK
+          chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/backend-feature-poc.sh
+          systemctl daemon-reload
+          systemctl enable backend-feature-poc
+      Tags:
+        - Key: Name
+          Value: backend-feature-poc
+        - Key: Purpose
+          Value: backend-feature-poc
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+      Tags:
+        - Key: Name
+          Value: backend-feature-poc
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  PublicIp:
+    Value: !Ref ElasticIp
+  SecurityGroupId:
+    Value: !Ref WebSecurityGroup

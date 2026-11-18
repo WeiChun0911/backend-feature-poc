@@ -1,0 +1,33 @@
+[Unit]
+Description=Restricted TShark TCP SYN capture for Backend Feature PoC
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=backend-feature-poc
+Group=backend-feature-poc
+SupplementaryGroups=wireshark
+RuntimeDirectory=backend-feature-poc-tshark
+RuntimeDirectoryMode=0750
+Environment=WIRESHARK_CONFIG_DIR=/run/backend-feature-poc-tshark/config
+ExecStartPre=/usr/bin/mkdir -p /run/backend-feature-poc-tshark/config
+ExecStartPre=/usr/bin/rm -f /run/backend-feature-poc-tshark/fields.fifo
+ExecStartPre=/usr/bin/mkfifo -m 0600 /run/backend-feature-poc-tshark/fields.fifo
+ExecStart=/bin/sh -c 'exec /usr/bin/tshark -i ens5 -n -l -s 128 -f "tcp dst port 443 and (tcp[13] & 2 != 0) and (tcp[13] & 16 = 0)" -T fields -E separator=@ -E occurrence=a -E aggregator=, -e frame.time_epoch -e ip.src -e ipv6.src -e tcp.srcport -e ip.dst -e ipv6.dst -e tcp.dstport -e tcp.window_size_value -e tcp.options.mss_val -e tcp.options.wscale.shift -e tcp.option_kind > /run/backend-feature-poc-tshark/fields.fifo'
+Restart=always
+RestartSec=1
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+RestrictSUIDSGID=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
